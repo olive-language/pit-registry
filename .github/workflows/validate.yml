@@ -1,0 +1,255 @@
+name: Validate PR
+
+on:
+  pull_request:
+    branches: [master, main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install blake3
+        run: pip install blake3 --quiet
+
+      - name: Ensure manual-review label exists
+        run: |
+          gh label create "manual-review" \
+            --color "e11d48" \
+            --description "New package  -  requires maintainer review" \
+            --repo "${{ github.repository }}" 2>/dev/null || true
+
+      # ── 1. Exactly one registry file changed ─────────────────────────────────
+      - name: Check single registry file changed
+        id: files
+        run: |
+          BASE="${{ github.base_ref }}"
+          CHANGED=$(git diff --name-only "origin/$BASE"...HEAD \
+            | grep -v -E '^(\.github/|README\.md$|\.gitignore$)')
+
+          COUNT=$(printf '%s\n' "$CHANGED" | grep -c '[^[:space:]]' || true)
+          if [[ "$COUNT" -ne 1 ]]; then
+            echo "::error::PR must change exactly one registry file (changed: $COUNT)"
+            exit 1
+          fi
+
+          PKG_FILE="$CHANGED"
+          pkg_name=$(basename "$PKG_FILE")
+          prefix=$(dirname "$PKG_FILE")
+          expected="${pkg_name:0:2}"
+
+          if [[ "$prefix" != "$expected" ]]; then
+            echo "::error::File must be at '$expected/$pkg_name', not '$prefix/$pkg_name'"
+            exit 1
+          fi
+
+          echo "pkg_file=$PKG_FILE" >> "$GITHUB_OUTPUT"
+          echo "pkg_name=$pkg_name" >> "$GITHUB_OUTPUT"
+
+      # ── 2. Exactly one new JSON line, zero removed lines ─────────────────────
+      - name: Extract new line
+        id: entry
+        env:
+          PKG_FILE: ${{ steps.files.outputs.pkg_file }}
+        run: |
+          BASE="${{ github.base_ref }}"
+
+          ADDED=$(git diff "origin/$BASE"...HEAD -- "$PKG_FILE" \
+            | grep '^+[^+]' | sed 's/^+//' | grep -v '^[[:space:]]*$')
+          REMOVED=$(git diff "origin/$BASE"...HEAD -- "$PKG_FILE" \
+            | grep '^-[^-]' | sed 's/^-//' | grep -v '^[[:space:]]*$')
+
+          A_COUNT=$(printf '%s\n' "$ADDED" | grep -c '[^[:space:]]' || true)
+          R_COUNT=$(printf '%s\n' "$REMOVED" | grep -c '[^[:space:]]' || true)
+
+          if [[ "$A_COUNT" -ne 1 ]]; then
+            echo "::error::PR must add exactly 1 JSON line (found: $A_COUNT)"
+            exit 1
+          fi
+          if [[ "$R_COUNT" -ne 0 ]]; then
+            echo "::error::PR must not remove existing lines (removed: $R_COUNT)"
+            exit 1
+          fi
+
+          echo "json_line<<__EOF__" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$ADDED" >> "$GITHUB_OUTPUT"
+          echo "__EOF__" >> "$GITHUB_OUTPUT"
+
+      # ── 3. Schema validation + duplicate version check ────────────────────────
+      - name: Validate JSON schema
+        id: schema
+        env:
+          JSON_LINE: ${{ steps.entry.outputs.json_line }}
+          PKG_FILE:  ${{ steps.files.outputs.pkg_file }}
+          PKG_NAME:  ${{ steps.files.outputs.pkg_name }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          line     = os.environ["JSON_LINE"].strip()
+          pkg_file = os.environ["PKG_FILE"]
+          pkg_name = os.environ["PKG_NAME"]
+
+          try:
+              d = json.loads(line)
+          except json.JSONDecodeError as e:
+              print(f"::error::Invalid JSON: {e}")
+              sys.exit(1)
+
+          errors = []
+          for field in ("name", "vers", "cksum", "dl"):
+              if not d.get(field):
+                  errors.append(f"missing required field '{field}'")
+
+          if d.get("name") and d["name"] != pkg_name:
+              errors.append(f"name '{d['name']}' must match filename '{pkg_name}'")
+
+          if not isinstance(d.get("deps", []), list):
+              errors.append("'deps' must be an array")
+
+          if d.get("dl") and not d["dl"].startswith("https://"):
+              errors.append("dl must use https")
+
+          # Check for duplicate version in existing file
+          if os.path.isfile(pkg_file):
+              new_vers = d.get("vers", "")
+              with open(pkg_file) as f:
+                  for lineno, existing in enumerate(f, 1):
+                      existing = existing.strip()
+                      if not existing:
+                          continue
+                      try:
+                          ed = json.loads(existing)
+                          if ed.get("vers") == new_vers:
+                              errors.append(f"version '{new_vers}' already exists (line {lineno})")
+                      except json.JSONDecodeError:
+                          pass  # pre-existing bad line; not our problem here
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+
+          print(f"Schema OK: {pkg_name}@{d['vers']}")
+          PYEOF
+
+          # Re-parse to expose outputs for later steps
+          CKSUM=$(python3 -c "import json,os; d=json.loads(os.environ['JSON_LINE']); print(d['cksum'])")
+          DL=$(python3    -c "import json,os; d=json.loads(os.environ['JSON_LINE']); print(d['dl'])")
+          VERS=$(python3  -c "import json,os; d=json.loads(os.environ['JSON_LINE']); print(d['vers'])")
+
+          echo "cksum=$CKSUM" >> "$GITHUB_OUTPUT"
+          echo "dl=$DL"       >> "$GITHUB_OUTPUT"
+          echo "vers=$VERS"   >> "$GITHUB_OUTPUT"
+
+      # ── 4. Download archive and verify BLAKE3 checksum ────────────────────────
+      - name: Verify BLAKE3 checksum
+        env:
+          DL_URL:          ${{ steps.schema.outputs.dl }}
+          EXPECTED_CKSUM:  ${{ steps.schema.outputs.cksum }}
+        run: |
+          echo "Downloading: $DL_URL"
+          curl -fsSL --max-time 120 "$DL_URL" -o archive.pit.zst
+
+          ACTUAL=$(python3 - <<'PYEOF'
+          import blake3, sys
+          h = blake3.blake3()
+          with open("archive.pit.zst", "rb") as f:
+              while True:
+                  chunk = f.read(65536)
+                  if not chunk:
+                      break
+                  h.update(chunk)
+          print(h.hexdigest())
+          PYEOF
+          )
+
+          echo "Expected: $EXPECTED_CKSUM"
+          echo "Actual:   $ACTUAL"
+
+          rm -f archive.pit.zst
+
+          if [[ "$ACTUAL" != "$EXPECTED_CKSUM" ]]; then
+            echo "::error::BLAKE3 mismatch  -  archive tampered or wrong file"
+            exit 1
+          fi
+
+          echo "Checksum verified."
+
+      # ── 5. Ownership check ────────────────────────────────────────────────────
+      - name: Ownership check
+        id: ownership
+        env:
+          PKG_FILE:   ${{ steps.files.outputs.pkg_file }}
+          PR_AUTHOR:  ${{ github.event.pull_request.user.login }}
+        run: |
+          BASE="${{ github.base_ref }}"
+
+          if git show "origin/$BASE:$PKG_FILE" &>/dev/null; then
+            # Existing package: find who first published it via the oldest commit
+            FIRST_COMMIT=$(git log --format="%H" "origin/$BASE" -- "$PKG_FILE" | tail -1)
+
+            if [[ -z "$FIRST_COMMIT" ]]; then
+              echo "::error::Cannot determine original commit for $PKG_FILE"
+              exit 1
+            fi
+
+            # Resolve the PR that introduced that commit
+            ORIGINAL_AUTHOR=$(gh api \
+              "repos/${{ github.repository }}/commits/$FIRST_COMMIT/pulls" \
+              --jq '.[0].user.login' 2>/dev/null || true)
+
+            if [[ -z "$ORIGINAL_AUTHOR" || "$ORIGINAL_AUTHOR" == "null" ]]; then
+              echo "::warning::Could not resolve original PR author via API; falling back to git committer"
+              ORIGINAL_AUTHOR=$(git log --format="%ae" "$FIRST_COMMIT" -1 | cut -d@ -f1)
+            fi
+
+            echo "Original author: $ORIGINAL_AUTHOR"
+            echo "PR author:       $PR_AUTHOR"
+
+            if [[ "$PR_AUTHOR" != "$ORIGINAL_AUTHOR" ]]; then
+              echo "::error::Package '$PKG_FILE' is owned by '$ORIGINAL_AUTHOR'. PR opened by '$PR_AUTHOR'  -  rejected."
+              exit 1
+            fi
+
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New package  -  flagging for manual review."
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 6a. New package: label and comment ───────────────────────────────────
+      - name: Label new package for manual review
+        if: steps.ownership.outputs.is_new == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PKG_NAME:  ${{ steps.files.outputs.pkg_name }}
+          VERS:      ${{ steps.schema.outputs.vers }}
+        run: |
+          gh pr edit "$PR_NUMBER" --add-label "manual-review"
+          gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
+          **New package detected:** \`$PKG_NAME@$VERS\`
+
+          Schema and checksum passed. Flagged for manual review to prevent name-squatting.
+          A maintainer will review and merge (or reject) this PR shortly.
+          EOF
+          )"
+
+      # ── 6b. Existing package + owner match: auto-merge ───────────────────────
+      - name: Auto-merge
+        if: steps.ownership.outputs.is_new == 'false'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh pr merge "$PR_NUMBER" --squash --delete-branch
